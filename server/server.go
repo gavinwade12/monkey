@@ -11,6 +11,8 @@ import (
 )
 
 type (
+	// OnClientRemoved will be called when a client is disconnected from the server.
+	OnClientRemoved func(id string)
 	// OnDispatch will be called when a message from a client is to be dispatched.
 	// The original message will be provided along with the ID of the sender.
 	// The function should return a slice of ClientIDs to broadcast the messages to,
@@ -19,7 +21,7 @@ type (
 	// OnErr will be called when the server encounters an error.
 	OnErr func(error)
 	// OnNewClient is called when a new client is connecting. The ClientID and Request
-	// are provided so external external bookkeeping can be done with the clients.
+	// are provided so external bookkeeping can be done with the clients.
 	// The function should return true if it's OK to connect the client, otherwise
 	// the connection will be closed.
 	OnNewClient func(id string, r *http.Request) bool
@@ -27,12 +29,14 @@ type (
 	// Server is the base type of this library. It does the low-level bookkeeping
 	// of clients and dispatches messages and errors.
 	Server struct {
-		done        chan bool
-		onDispatch  OnDispatch
-		onErr       OnErr
-		onNewClient OnNewClient
-		mu          *sync.RWMutex
-		messengers  map[string]*messenger
+		done            chan bool
+		onClientRemoved OnClientRemoved
+		onDispatch      OnDispatch
+		onErr           OnErr
+		onNewClient     OnNewClient
+		mu              *sync.RWMutex
+		messengers      map[string]*messenger
+		running         bool
 	}
 )
 
@@ -49,14 +53,15 @@ var (
 )
 
 // New returns an instantiated server.
-func New(od OnDispatch, oe OnErr, onc OnNewClient) *Server {
+func New(ocr OnClientRemoved, od OnDispatch, oe OnErr, onc OnNewClient) *Server {
 	return &Server{
-		done:        make(chan bool),
-		onDispatch:  od,
-		onErr:       oe,
-		onNewClient: onc,
-		mu:          &sync.RWMutex{},
-		messengers:  make(map[string]*messenger),
+		onClientRemoved: ocr,
+		onDispatch:      od,
+		onErr:           oe,
+		onNewClient:     onc,
+		mu:              &sync.RWMutex{},
+		messengers:      make(map[string]*messenger),
+		running:         false,
 	}
 }
 
@@ -71,8 +76,11 @@ func (s *Server) add(m *messenger) {
 // the clients found.
 func (s *Server) dispatch(msg []byte, senderID string) {
 	ids, msg := s.onDispatch(msg, senderID)
-	var sendTo []*messenger
+	if len(ids) == 0 || len(msg) == 0 {
+		return
+	}
 
+	var sendTo []*messenger
 	s.mu.RLock()
 	for _, m := range s.messengers {
 		var c *messenger
@@ -83,10 +91,15 @@ func (s *Server) dispatch(msg []byte, senderID string) {
 			}
 		}
 		if c == nil {
-			s.err(ErrClientNotFound)
+			// Since the server has no knowledge of the OnErr call expense, we
+			// currently won't risk calling it while holding a lock.
+			// s.err(ErrClientNotFound)
 			continue
 		}
 		sendTo = append(sendTo, c)
+		if len(sendTo) == len(ids) {
+			break
+		}
 	}
 	s.mu.RUnlock()
 
@@ -95,34 +108,16 @@ func (s *Server) dispatch(msg []byte, senderID string) {
 	}
 }
 
-// Err passes the error to the server's OnError function.
+// err passes the error to the server's OnError function.
 func (s *Server) err(err error) {
 	s.onErr(err)
 }
 
-// Remove the client from the server.
-func (s *Server) Remove(id string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if m := s.messengers[id]; m != nil {
-		m.done()
-	}
-	delete(s.messengers, id)
-}
-
-// SetOnNewClient sets a new function to be called when a new client connects.
-// This could be used to limit the number of clients connected to the server.
-func (s *Server) SetOnNewClient(onc OnNewClient) {
-	s.onNewClient = onc
-}
-
-// Start starts the server.
-func (s *Server) Start(addr string) {
-	http.Handle(addr, websocket.Handler(s.newClientHandler))
-}
-
+// The handler used for when a client connects to the server.
 func (s *Server) newClientHandler(conn *websocket.Conn) {
-	if conn == nil {
+	if !s.running {
+		return
+	} else if conn == nil {
 		s.err(ErrNilConn)
 		return
 	} else if !conn.IsServerConn() {
@@ -141,4 +136,41 @@ func (s *Server) newClientHandler(conn *websocket.Conn) {
 	m := newMessenger(id, conn, s)
 	s.add(m)
 	m.start()
+}
+
+// Remove the client from the server.
+func (s *Server) Remove(id string) {
+	s.mu.Lock()
+	m := s.messengers[id]
+	s.remove(m, id)
+	s.mu.Unlock()
+	s.onClientRemoved(id)
+}
+
+func (s *Server) remove(m *messenger, id string) {
+	if m == nil {
+		return
+	}
+	m.done()
+	delete(s.messengers, id)
+}
+
+// Start starts the server.
+func (s *Server) Start(socketPattern string) {
+	s.running = true
+	http.Handle(socketPattern, websocket.Handler(s.newClientHandler))
+}
+
+// Stop serving new clients and close connections with all existing clients.
+func (s *Server) Stop() {
+	s.running = false
+
+	s.mu.Lock()
+	for id, m := range s.messengers {
+		s.remove(m, id)
+		// It doesn't really matter how expensive this will be since the server
+		// is no longer running.
+		s.onClientRemoved(id)
+	}
+	s.mu.Unlock()
 }
