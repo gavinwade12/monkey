@@ -16,7 +16,8 @@ type (
 	// OnDispatch will be called when a message from a client is to be dispatched.
 	// The original message will be provided along with the ID of the sender.
 	// The function should return a slice of ClientIDs to broadcast the messages to,
-	// as well as a possibly altered message to broadcast.
+	// as well as a possibly altered message to broadcast. If the slice of ClientIDs
+	// is nil, the message will be broadcast to all connected clients.
 	OnDispatch func(msg []byte, senderID string) ([]string, []byte)
 	// OnErr will be called when the server encounters an error.
 	OnErr func(error)
@@ -76,7 +77,7 @@ func (s *Server) add(m *messenger) {
 // the clients found.
 func (s *Server) dispatch(msg []byte, senderID string) {
 	ids, msg := s.onDispatch(msg, senderID)
-	if len(ids) == 0 || len(msg) == 0 {
+	if (ids != nil && len(ids) == 0) || len(msg) == 0 {
 		return
 	}
 
@@ -84,11 +85,15 @@ func (s *Server) dispatch(msg []byte, senderID string) {
 	s.mu.RLock()
 	for _, m := range s.messengers {
 		var c *messenger
-		for _, id := range ids {
-			if m.clientID == id {
-				c = m
-				break
+		if ids != nil {
+			for _, id := range ids {
+				if m.clientID == id {
+					c = m
+					break
+				}
 			}
+		} else {
+			c = m
 		}
 		if c == nil {
 			// Since the server has no knowledge of the OnErr call expense, we
